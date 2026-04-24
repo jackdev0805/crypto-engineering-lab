@@ -19,6 +19,15 @@ def sha256_str(data: str) -> str:
     return sha256_hex(data.encode("utf-8"))
 
 
+def public_key_to_address(public_key_hex: str) -> str:
+    """
+    학습용 address 생성 함수.
+    실제 비트코인처럼 Base58Check를 쓰지 않고,
+    public key hex를 한 번 SHA-256 해서 앞 일부를 address처럼 사용한다.
+    """
+    return "addr_" + sha256_str(public_key_hex)[:40]
+
+
 @dataclass
 class TransactionInput:
     prev_tx_id: str
@@ -38,11 +47,11 @@ class TransactionInput:
 
 @dataclass
 class TransactionOutput:
-    recipient: str
+    recipient_address: str
     amount: int
 
     def serialize(self) -> str:
-        return f"{self.recipient}:{self.amount}"
+        return f"{self.recipient_address}:{self.amount}"
 
 
 @dataclass
@@ -72,10 +81,10 @@ class Transaction:
         self.tx_id = self.calculate_tx_id()
 
     @staticmethod
-    def coinbase(recipient: str, amount: int, meta: str) -> "Transaction":
+    def coinbase(recipient_address: str, amount: int, meta: str) -> "Transaction":
         tx = Transaction(
             inputs=[],
-            outputs=[TransactionOutput(recipient=recipient, amount=amount)],
+            outputs=[TransactionOutput(recipient_address=recipient_address, amount=amount)],
             meta=meta,
         )
         tx.finalize()
@@ -86,7 +95,7 @@ class Transaction:
 class UTXO:
     tx_id: str
     output_index: int
-    recipient: str
+    recipient_address: str
     amount: int
 
     def key(self) -> str:
@@ -108,11 +117,11 @@ class UTXOSet:
         key = f"{prev_tx_id}:{output_index}"
         return self.utxos.get(key)
 
-    def all_for_recipient(self, recipient: str) -> List[UTXO]:
-        return [utxo for utxo in self.utxos.values() if utxo.recipient == recipient]
+    def all_for_address(self, address: str) -> List[UTXO]:
+        return [utxo for utxo in self.utxos.values() if utxo.recipient_address == address]
 
-    def balance_of(self, recipient: str) -> int:
-        return sum(utxo.amount for utxo in self.all_for_recipient(recipient))
+    def balance_of(self, address: str) -> int:
+        return sum(utxo.amount for utxo in self.all_for_address(address))
 
     def copy(self) -> "UTXOSet":
         cloned = UTXOSet()
@@ -143,20 +152,24 @@ class Wallet:
     def public_key_hex(self) -> str:
         return self.public_key.to_string().hex()
 
+    @property
+    def address(self) -> str:
+        return public_key_to_address(self.public_key_hex)
+
     def balance(self, utxo_set: UTXOSet) -> int:
-        return utxo_set.balance_of(self.public_key_hex)
+        return utxo_set.balance_of(self.address)
 
     def create_transaction(
         self,
         utxo_set: UTXOSet,
-        recipient_public_key_hex: str,
+        recipient_address: str,
         amount: int,
         meta: str = "",
     ) -> Transaction:
         if amount <= 0:
             raise ValueError("amount must be positive")
 
-        my_utxos = utxo_set.all_for_recipient(self.public_key_hex)
+        my_utxos = utxo_set.all_for_address(self.address)
 
         selected_utxos: List[UTXO] = []
         total = 0
@@ -176,13 +189,13 @@ class Wallet:
         ]
 
         outputs = [
-            TransactionOutput(recipient=recipient_public_key_hex, amount=amount)
+            TransactionOutput(recipient_address=recipient_address, amount=amount)
         ]
 
         change = total - amount
         if change > 0:
             outputs.append(
-                TransactionOutput(recipient=self.public_key_hex, amount=change)
+                TransactionOutput(recipient_address=self.address, amount=change)
             )
 
         tx = Transaction(
@@ -250,9 +263,9 @@ class Blockchain:
         self.chain: List[Block] = []
         self.utxo_set = UTXOSet()
 
-    def create_genesis_block(self, recipient: str) -> Block:
+    def create_genesis_block(self, recipient_address: str) -> Block:
         genesis_tx = Transaction.coinbase(
-            recipient=recipient,
+            recipient_address=recipient_address,
             amount=self.block_reward,
             meta="genesis-block-0",
         )
@@ -282,6 +295,7 @@ class Blockchain:
                 print("[INVALID TX] output amount must be positive")
                 return False
 
+        # coinbase
         if not tx.inputs:
             total_output = sum(output.amount for output in tx.outputs)
             if total_output <= 0:
@@ -306,8 +320,14 @@ class Blockchain:
                 print("[INVALID TX] 존재하지 않거나 이미 소비된 UTXO 사용")
                 return False
 
-            if utxo.recipient != tx_input.public_key_hex:
-                print("[INVALID TX] 공개키가 UTXO 소유자와 일치하지 않음")
+            if not tx_input.public_key_hex:
+                print("[INVALID TX] public key가 비어 있음")
+                return False
+
+            derived_address = public_key_to_address(tx_input.public_key_hex)
+
+            if utxo.recipient_address != derived_address:
+                print("[INVALID TX] 공개키로부터 계산한 주소가 UTXO 소유자와 일치하지 않음")
                 return False
 
             if not tx_input.signature_hex:
@@ -340,7 +360,7 @@ class Blockchain:
             utxo = UTXO(
                 tx_id=tx.tx_id,
                 output_index=index,
-                recipient=tx_output.recipient,
+                recipient_address=tx_output.recipient_address,
                 amount=tx_output.amount,
             )
             utxo_set.add_utxo(utxo)
@@ -353,7 +373,7 @@ class Blockchain:
         next_index = self.latest_block().index + 1
 
         coinbase_tx = Transaction.coinbase(
-            recipient=miner_wallet.public_key_hex,
+            recipient_address=miner_wallet.address,
             amount=self.block_reward,
             meta=f"coinbase-height-{next_index}-miner-{miner_wallet.name}",
         )
@@ -426,12 +446,13 @@ class Blockchain:
         print("\n[Balances]")
         for wallet in wallets:
             balance = wallet.balance(self.utxo_set)
-            utxo_count = len(self.utxo_set.all_for_recipient(wallet.public_key_hex))
+            utxo_count = len(self.utxo_set.all_for_address(wallet.address))
             print(f"  {wallet.name}: {balance} ({utxo_count} UTXOs)")
+            print(f"    address: {wallet.address}")
 
     def print_chain(self, wallet_lookup: Dict[str, str]) -> None:
-        def owner_name(pubkey_hex: str) -> str:
-            return wallet_lookup.get(pubkey_hex, pubkey_hex[:16] + "...")
+        def owner_name(address: str) -> str:
+            return wallet_lookup.get(address, address)
 
         for block in self.chain:
             print("=" * 100)
@@ -456,7 +477,7 @@ class Blockchain:
                 for idx, tx_output in enumerate(tx.outputs):
                     print(
                         f"    output[{idx}] -> "
-                        f"{owner_name(tx_output.recipient)}: {tx_output.amount}"
+                        f"{owner_name(tx_output.recipient_address)}: {tx_output.amount}"
                     )
         print("=" * 100)
 
@@ -468,22 +489,22 @@ def main() -> None:
     miner1 = Wallet("Miner1")
 
     wallet_lookup = {
-        satoshi.public_key_hex: satoshi.name,
-        alice.public_key_hex: alice.name,
-        bob.public_key_hex: bob.name,
-        miner1.public_key_hex: miner1.name,
+        satoshi.address: satoshi.name,
+        alice.address: alice.name,
+        bob.address: bob.name,
+        miner1.address: miner1.name,
     }
 
     blockchain = Blockchain(difficulty=4, block_reward=50)
-    blockchain.create_genesis_block(recipient=satoshi.public_key_hex)
+    blockchain.create_genesis_block(recipient_address=satoshi.address)
 
     print("[*] Genesis created")
     blockchain.print_balances([satoshi, alice, bob, miner1])
 
-    print("\n[*] Satoshi creates tx1: send 30 to Alice")
+    print("\n[*] Satoshi creates tx1: send 30 to Alice address")
     tx1 = satoshi.create_transaction(
         utxo_set=blockchain.utxo_set,
-        recipient_public_key_hex=alice.public_key_hex,
+        recipient_address=alice.address,
         amount=30,
         meta="satoshi-to-alice",
     )
@@ -492,10 +513,10 @@ def main() -> None:
     blockchain.add_block([tx1], miner1)
     blockchain.print_balances([satoshi, alice, bob, miner1])
 
-    print("\n[*] Alice creates tx2: send 10 to Bob")
+    print("\n[*] Alice creates tx2: send 10 to Bob address")
     tx2 = alice.create_transaction(
         utxo_set=blockchain.utxo_set,
-        recipient_public_key_hex=bob.public_key_hex,
+        recipient_address=bob.address,
         amount=10,
         meta="alice-to-bob",
     )
